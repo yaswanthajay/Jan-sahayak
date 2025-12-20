@@ -1,7 +1,8 @@
 {
-  "name": "Copy of Jan Sahayak - AI Voice Agent",
+  "name": "Jan Sahayak - AI Voice Agent",
   "description": "A voice-first agentic AI for government welfare scheme discovery and application in native Indian languages.",
   "requestFramePermissions": [
+    "camera",
     "microphone",
     "geolocation"
   ]

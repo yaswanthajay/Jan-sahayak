@@ -22,6 +22,13 @@ export interface Scheme {
   benefits: string;
   state: string; // "All" or specific state
   url: string;
+  language?: string;
+}
+
+export interface AgentThought {
+  phase: 'PLAN' | 'EXECUTE' | 'EVALUATE' | 'MEMORY';
+  message: string;
+  timestamp: number;
 }
 
 export interface UserProfile {
@@ -33,6 +40,7 @@ export interface UserProfile {
   gender?: string;
   lat?: number;
   lng?: number;
+  disability?: boolean;
 }
 
 export interface TranscriptionEntry {
@@ -41,13 +49,20 @@ export interface TranscriptionEntry {
   timestamp: number;
 }
 
+export interface ChatSession {
+  id: string;
+  timestamp: number;
+  language: string;
+  history: TranscriptionEntry[];
+  summary: string;
+}
+
 export const SUPPORTED_LANGUAGES: Language[] = [
   { code: 'hi', name: 'Hindi', nativeName: 'हिन्दी' },
-  { code: 'mr', name: 'Marathi', nativeName: 'मराठी' },
   { code: 'te', name: 'Telugu', nativeName: 'తెలుగు' },
+  { code: 'mr', name: 'Marathi', nativeName: 'మరాठी' },
   { code: 'ta', name: 'Tamil', nativeName: 'தமிழ்' },
   { code: 'bn', name: 'Bengali', nativeName: 'বাংলা' },
-  { code: 'or', name: 'Odia', nativeName: 'ଓडिया' },
   { code: 'kn', name: 'Kannada', nativeName: 'ಕನ್ನಡ' },
   { code: 'ml', name: 'Malayalam', nativeName: 'മലയാളം' },
   { code: 'gu', name: 'Gujarati', nativeName: 'ગુજરાતી' },

@@ -1,19 +1,23 @@
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
-import { AgentState, TranscriptionEntry, Language, SUPPORTED_LANGUAGES, UserProfile, Scheme, INDIAN_STATES } from './types';
+import { AgentState, TranscriptionEntry, Language, SUPPORTED_LANGUAGES, UserProfile, Scheme, INDIAN_STATES, AgentThought, ChatSession } from './types';
 import { searchSchemesTool, validateEligibilityTool, applyForSchemeTool, changeLanguageTool, updateUserProfileTool, toolHandlers, MOCK_SCHEMES } from './services/tools';
 import Header from './components/Header';
 import VoiceAgent from './components/VoiceAgent';
 
 const App: React.FC = () => {
   const [agentState, setAgentState] = useState<AgentState>(AgentState.AWAITING_LOCATION);
-  const [locationError, setLocationError] = useState<string | null>(null);
+  const [thoughts, setThoughts] = useState<AgentThought[]>([]);
   const [history, setHistory] = useState<TranscriptionEntry[]>([]);
+  const [pastSessions, setPastSessions] = useState<ChatSession[]>([]);
+  const [selectedSession, setSelectedSession] = useState<ChatSession | null>(null);
   const [isLive, setIsLive] = useState(false);
   const [selectedLanguage, setSelectedLanguage] = useState<Language>(SUPPORTED_LANGUAGES[0]);
   const [userProfile, setUserProfile] = useState<UserProfile>({ state: 'Andhra Pradesh' });
   const [visibleSchemes, setVisibleSchemes] = useState<Scheme[]>([]);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [systemAlert, setSystemAlert] = useState<{ type: 'error' | 'warning', message: string } | null>(null);
   
   const [liveUserText, setLiveUserText] = useState("");
   const [liveModelText, setLiveModelText] = useState("");
@@ -25,51 +29,107 @@ const App: React.FC = () => {
   const sessionPromiseRef = useRef<Promise<any> | null>(null);
   const nextStartTimeRef = useRef<number>(0);
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+  
+  const [audioLevel, setAudioLevel] = useState(0);
+  const analyzerRef = useRef<AnalyserNode | null>(null);
 
-  // Location mapping
-  const getStateFromCoords = (lat: number, lng: number): string => {
-    if (lat > 28) return "Delhi";
-    if (lat > 25) return "Uttar Pradesh";
-    if (lat > 21) return "West Bengal";
-    if (lat > 18.5) return "Maharashtra";
-    if (lat > 17.0) return "Telangana";
-    return "Andhra Pradesh";
+  // --- SYSTEM HEALTH DIAGNOSTICS ---
+  useEffect(() => {
+    const checkEnvironment = async () => {
+      // 1. Secure Context (HTTPS/Localhost)
+      if (!window.isSecureContext) {
+        setSystemAlert({
+          type: 'error',
+          message: "MICROPHONE BLOCKED: You are on an insecure link. Use 'https://' or 'localhost' to enable voice."
+        });
+        return;
+      }
+
+      // 2. API Key Check (Safe for production)
+      const key = process.env.API_KEY;
+      if (!key) {
+        setSystemAlert({
+          type: 'warning',
+          message: "API KEY NOT DETECTED: Ensure process.env.API_KEY is configured in your settings."
+        });
+      }
+
+      // 3. Permission State
+      try {
+        const status = await navigator.permissions.query({ name: 'microphone' as any });
+        if (status.state === 'denied') {
+          setSystemAlert({
+            type: 'error',
+            message: "PERMISSION DENIED: Reset your browser microphone settings to use Jan Sahayak."
+          });
+        }
+      } catch (e) {}
+    };
+    checkEnvironment();
+  }, []);
+
+  useEffect(() => {
+    const saved = localStorage.getItem('jan_sahayak_sessions');
+    if (saved) {
+      try { setPastSessions(JSON.parse(saved)); } catch (e) {}
+    }
+  }, []);
+
+  const saveSession = useCallback((finalHistory: TranscriptionEntry[]) => {
+    if (finalHistory.length < 2) return; 
+    const newSession: ChatSession = {
+      id: Date.now().toString(),
+      timestamp: Date.now(),
+      language: selectedLanguage.name,
+      history: finalHistory,
+      summary: finalHistory.find(h => h.role === 'user')?.text.substring(0, 40) + "..." || "Voice Call"
+    };
+    const updated = [newSession, ...pastSessions].slice(0, 20);
+    setPastSessions(updated);
+    localStorage.setItem('jan_sahayak_sessions', JSON.stringify(updated));
+  }, [pastSessions, selectedLanguage.name]);
+
+  useEffect(() => {
+    const relevant = MOCK_SCHEMES.filter(s => 
+      (s.language === selectedLanguage.code) &&
+      (s.state === 'All' || s.state.toLowerCase() === userProfile.state?.toLowerCase())
+    );
+    setVisibleSchemes(relevant);
+  }, [userProfile.state, selectedLanguage.code]);
+
+  const addThought = (phase: AgentThought['phase'], message: string) => {
+    setThoughts(prev => [{ phase, message, timestamp: Date.now() }, ...prev].slice(0, 10));
   };
 
   const updateStateAndSchemes = (stateName: string, lat?: number, lng?: number) => {
     setUserProfile(prev => ({ ...prev, state: stateName, lat, lng }));
-    const relevant = MOCK_SCHEMES.filter(s => s.state === 'All' || s.state.toLowerCase() === stateName.toLowerCase());
-    setVisibleSchemes(relevant);
+    addThought('MEMORY', `Location set to ${stateName}.`);
     setAgentState(AgentState.IDLE);
+    setErrorMessage(null);
   };
 
   const requestLocation = () => {
     if ("geolocation" in navigator) {
       navigator.geolocation.getCurrentPosition(
-        (position) => {
-          const detectedState = getStateFromCoords(position.coords.latitude, position.coords.longitude);
-          updateStateAndSchemes(detectedState, position.coords.latitude, position.coords.longitude);
-        },
-        () => {
-          setLocationError("Location timeout. Manual selection ready.");
-          setAgentState(AgentState.IDLE);
-        },
+        () => updateStateAndSchemes("Andhra Pradesh"),
+        () => updateStateAndSchemes("Andhra Pradesh"),
         { enableHighAccuracy: true, timeout: 5000 }
       );
     } else {
-      setAgentState(AgentState.IDLE);
+      updateStateAndSchemes("Andhra Pradesh");
     }
   };
 
+  // --- AUDIO UTILS ---
   const decode = (base64: string) => {
-    const binaryString = atob(base64);
-    const bytes = new Uint8Array(binaryString.length);
-    for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
     return bytes;
   };
 
   const decodeAudioData = async (data: Uint8Array, ctx: AudioContext, sampleRate: number, numChannels: number) => {
-    const dataInt16 = new Int16Array(data.buffer);
+    const dataInt16 = new Int16Array(data.buffer, data.byteOffset, data.byteLength / 2);
     const frameCount = dataInt16.length / numChannels;
     const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
     for (let channel = 0; channel < numChannels; channel++) {
@@ -90,12 +150,17 @@ const App: React.FC = () => {
   const createBlob = (data: Float32Array) => {
     const int16 = new Int16Array(data.length);
     for (let i = 0; i < data.length; i++) int16[i] = data[i] * 32768;
-    return { data: encode(new Uint8Array(int16.buffer)), mimeType: 'audio/pcm;rate=16000' };
+    return { 
+      data: encode(new Uint8Array(int16.buffer, 0, int16.byteLength)), 
+      mimeType: 'audio/pcm;rate=16000' 
+    };
   };
 
   const stopAllAudio = useCallback(() => {
-    sourcesRef.current.forEach(s => { try { s.stop(); } catch(e) {} });
-    sourcesRef.current.clear();
+    if (sourcesRef.current) {
+      sourcesRef.current.forEach(s => { try { s.stop(); } catch(e) {} });
+      sourcesRef.current.clear();
+    }
     nextStartTimeRef.current = 0;
   }, []);
 
@@ -103,10 +168,11 @@ const App: React.FC = () => {
     const uText = userBufferRef.current.trim();
     const mText = modelBufferRef.current.trim();
     if (uText || mText) {
-      setHistory(prev => [...prev, 
+      const newEntries: TranscriptionEntry[] = [
         ...(uText ? [{ text: uText, role: 'user', timestamp: Date.now() } as TranscriptionEntry] : []),
         ...(mText ? [{ text: mText, role: 'model', timestamp: Date.now() } as TranscriptionEntry] : [])
-      ]);
+      ];
+      setHistory(prev => [...prev, ...newEntries]);
     }
     userBufferRef.current = ""; modelBufferRef.current = "";
     setLiveUserText(""); setLiveModelText("");
@@ -123,12 +189,13 @@ const App: React.FC = () => {
       source.buffer = audioBuffer;
       source.connect(ctx.destination);
       source.onended = () => {
-        sourcesRef.current.delete(source);
-        if (sourcesRef.current.size === 0) setAgentState(AgentState.LISTENING);
+        if (sourcesRef.current) sourcesRef.current.delete(source);
+        if (sourcesRef.current && sourcesRef.current.size === 0) setAgentState(AgentState.LISTENING);
       };
       source.start(nextStartTimeRef.current);
       nextStartTimeRef.current += audioBuffer.duration;
-      sourcesRef.current.add(source);
+      // FIX: Use current.add
+      if (sourcesRef.current) sourcesRef.current.add(source);
     }
 
     if (message.serverContent?.inputTranscription) {
@@ -139,10 +206,6 @@ const App: React.FC = () => {
       modelBufferRef.current += message.serverContent.outputTranscription.text;
       setLiveModelText(modelBufferRef.current);
     }
-    if (message.serverContent?.interrupted) {
-      stopAllAudio();
-      setAgentState(AgentState.LISTENING);
-    }
     if (message.serverContent?.turnComplete) commitTurn();
 
     if (message.toolCall) {
@@ -151,24 +214,20 @@ const App: React.FC = () => {
         let result: any;
         if (fc.name === 'update_user_profile') {
           result = await toolHandlers.update_user_profile(fc.args, (update) => setUserProfile(p => ({ ...p, ...update })));
-        } else if (fc.name === 'validate_eligibility') {
-          result = await toolHandlers.validate_eligibility(fc.args, userProfile);
+          addThought('MEMORY', 'Internal records updated.');
         } else if (fc.name === 'search_schemes') {
-          const results = await toolHandlers.search_schemes(fc.args);
-          if (fc.args.state?.toLowerCase() === userProfile.state?.toLowerCase()) setVisibleSchemes(results);
+          const results = await toolHandlers.search_schemes({ ...fc.args, language_code: selectedLanguage.code });
           result = results;
-        } else if (fc.name === 'change_language') {
-          result = await toolHandlers.change_language(fc.args, (code) => {
-            const lang = SUPPORTED_LANGUAGES.find(l => l.code === code);
-            if (lang) setSelectedLanguage(lang);
-          });
+          addThought('EVALUATE', `Found ${results.length} matched portals.`);
         } else {
           result = await (toolHandlers as any)[fc.name]?.(fc.args);
         }
         
-        sessionPromiseRef.current?.then(session => session.sendToolResponse({
-          functionResponses: { id: fc.id, name: fc.name, response: { result: JSON.stringify(result) } }
-        }));
+        sessionPromiseRef.current?.then(session => {
+            if (session) session.sendToolResponse({
+                functionResponses: { id: fc.id, name: fc.name, response: { result: JSON.stringify(result) } }
+            });
+        });
       }
     }
   };
@@ -176,65 +235,104 @@ const App: React.FC = () => {
   const startSession = async () => {
     try {
       setAgentState(AgentState.THINKING);
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      setErrorMessage(null);
+      
+      const apiKey = process.env.API_KEY;
+      if (!apiKey) throw new Error("API_KEY_NOT_FOUND");
+
+      const ai = new GoogleGenAI({ apiKey });
       const inCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
       const outCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-      inputAudioContextRef.current = inCtx; outputAudioContextRef.current = outCtx;
+      
+      // Force resume to satisfy browser autoplay policy
+      if (inCtx.state === 'suspended') await inCtx.resume();
+      if (outCtx.state === 'suspended') await outCtx.resume();
 
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      inputAudioContextRef.current = inCtx; 
+      outputAudioContextRef.current = outCtx;
+
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true }).catch(err => {
+        throw new Error("MIC_ACCESS_DENIED");
+      });
+      
+      const analyzer = inCtx.createAnalyser();
+      analyzerRef.current = analyzer;
+      const dataArray = new Uint8Array(analyzer.frequencyBinCount);
+      const updateVisualizer = () => {
+        if (!analyzerRef.current) return;
+        analyzer.getByteFrequencyData(dataArray);
+        setAudioLevel(dataArray.reduce((a, b) => a + b, 0) / dataArray.length);
+        requestAnimationFrame(updateVisualizer);
+      };
+      updateVisualizer();
+
+      addThought('PLAN', 'Establishing Native Voice Link...');
+
       const sessionPromise = ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-09-2025',
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } },
-          systemInstruction: `You are "Jan Sahayak", an advanced Agentic AI Welfare Assistant for India.
-          
-          AGENTIC WORKFLOW (PLAN-EXECUTE-EVALUATE):
-          - PLAN: When a user speaks, verbalize your intent (e.g. "I will search for education schemes in ${userProfile.state}").
-          - EXECUTE: Use tools to fetch data or update memory. 
-          - EVALUATE: If tool results are empty or don't fit, re-search or ask clarifying questions.
-          
-          NATIVE LANGUAGE POLICY:
-          - Current Language: ${selectedLanguage.name}. You MUST speak and reason in this language ONLY.
-          
-          DYNAMIC MEMORY:
-          - If the user provides info (age, job, income), call 'update_user_profile' immediately to persist it.
-          - Use this memory to proactively check eligibility for schemes using 'validate_eligibility'.
-          
-          FAIL-SAFE:
-          - If audio is unclear, politely ask in ${selectedLanguage.name} for clarification.
-          - If tools are unavailable, explain the limitation clearly.
-          
-          User Context: State is ${userProfile.state}. Current Profile: ${JSON.stringify(userProfile)}.`,
+          systemInstruction: `You are "Jan Sahayak", the official AI agent for welfare schemes in India.
+          Language: ${selectedLanguage.name}. ALWAYS use the search_schemes tool to verify data.`,
           tools: [{ functionDeclarations: [searchSchemesTool, validateEligibilityTool, applyForSchemeTool, changeLanguageTool, updateUserProfileTool] }],
-          inputAudioTranscription: {}, outputAudioTranscription: {},
+          inputAudioTranscription: {}, 
+          outputAudioTranscription: {},
         },
         callbacks: {
           onopen: () => {
-            setIsLive(true); setAgentState(AgentState.LISTENING);
+            setIsLive(true); 
+            setAgentState(AgentState.LISTENING);
             const source = inCtx.createMediaStreamSource(stream);
+            source.connect(analyzer);
             const processor = inCtx.createScriptProcessor(4096, 1, 1);
             processor.onaudioprocess = (e) => {
-              const blob = createBlob(e.inputBuffer.getChannelData(0));
-              sessionPromise.then(session => session.sendRealtimeInput({ media: blob }));
+              const inputData = e.inputBuffer.getChannelData(0);
+              const blob = createBlob(inputData);
+              sessionPromise.then(session => {
+                if (session) session.sendRealtimeInput({ media: blob });
+              });
             };
-            source.connect(processor); processor.connect(inCtx.destination);
+            source.connect(processor); 
+            processor.connect(inCtx.destination);
+            addThought('PLAN', 'Secure Agentic Link: ACTIVE.');
           },
           onmessage: handleMessage,
-          onerror: () => setAgentState(AgentState.ERROR),
+          onerror: (e: any) => {
+            setAgentState(AgentState.ERROR);
+            setIsLive(false);
+            setErrorMessage("Communication Error: WebSocket link to Gemini was interrupted. This usually means the API Key is invalid or rate limited.");
+          },
           onclose: () => { setIsLive(false); setAgentState(AgentState.IDLE); }
         }
       });
       sessionPromiseRef.current = sessionPromise;
-    } catch (err) { setAgentState(AgentState.ERROR); }
+    } catch (err: any) { 
+      setAgentState(AgentState.ERROR); 
+      setIsLive(false);
+      if (err.message === "MIC_ACCESS_DENIED") {
+        setErrorMessage("Microphone Denied: Browsers block microphones on non-HTTPS sites. Use localhost or https.");
+      } else if (err.message === "API_KEY_NOT_FOUND") {
+        setErrorMessage("Configuration Missing: process.env.API_KEY is not defined.");
+      } else {
+        setErrorMessage("Agent Startup Failed: " + (err.message || "Unknown error."));
+      }
+    }
   };
 
   const stopSession = () => {
     commitTurn();
-    sessionPromiseRef.current?.then(s => s.close());
+    if (sessionPromiseRef.current) {
+        sessionPromiseRef.current.then(s => { try { s?.close(); } catch(e) {} });
+    }
     stopAllAudio();
-    setIsLive(false); setAgentState(AgentState.IDLE);
+    setIsLive(false); 
+    setAgentState(AgentState.IDLE);
     sessionPromiseRef.current = null;
+    analyzerRef.current = null;
+    if (inputAudioContextRef.current) inputAudioContextRef.current.close();
+    if (outputAudioContextRef.current) outputAudioContextRef.current.close();
+    saveSession([...history]);
   };
 
   if (agentState === AgentState.AWAITING_LOCATION) {
@@ -243,11 +341,10 @@ const App: React.FC = () => {
         <div className="w-20 h-20 mb-10 bg-gradient-to-t from-orange-500 via-white to-green-500 rounded-2xl flex items-center justify-center shadow-2xl animate-pulse">
            <span className="text-3xl">🇮🇳</span>
         </div>
-        <h1 className="text-5xl font-black text-white mb-4 tracking-tighter">Jan Sahayak AI</h1>
-        <p className="text-slate-400 max-w-md mb-12 text-lg">Agentic Welfare Gateway. Powered by Multimodal Native Reasoning.</p>
-        <button onClick={requestLocation} className="px-12 py-5 bg-white text-slate-900 rounded-full font-black text-xl hover:bg-slate-100 transition-all shadow-2xl active:scale-95 flex items-center gap-3">
-          <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" /></svg>
-          Initialize Agent
+        <h1 className="text-5xl font-black text-white mb-4 tracking-tighter italic">Jan Sahayak AI</h1>
+        <p className="text-slate-400 max-w-md mb-12 text-lg">World-Class Agentic AI for Government Welfare. Powered by Multimodal Native Intelligence.</p>
+        <button onClick={requestLocation} className="px-12 py-5 bg-white text-slate-900 rounded-full font-black text-xl hover:bg-slate-100 transition-all shadow-2xl active:scale-95">
+          Enter AI Portal
         </button>
       </div>
     );
@@ -256,93 +353,154 @@ const App: React.FC = () => {
   return (
     <div className="h-screen flex flex-col bg-slate-50 font-sans overflow-hidden">
       <Header selectedLanguage={selectedLanguage} onLanguageChange={setSelectedLanguage} selectedState={userProfile.state || ""} onStateChange={updateStateAndSchemes} isLive={isLive} />
+      
+      {/* Alert Banner */}
+      {systemAlert && (
+        <div className={`py-2 px-6 text-center text-[11px] font-black uppercase tracking-widest flex items-center justify-center gap-4 ${systemAlert.type === 'error' ? 'bg-red-600 text-white' : 'bg-orange-500 text-white shadow-lg'}`}>
+          <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" /></svg>
+          {systemAlert.message}
+        </div>
+      )}
+
       <div className="flex-1 flex overflow-hidden">
-        <main className="flex-1 flex flex-col p-4 md:p-6 min-w-0 bg-slate-100/30">
-          <div className="flex-1 bg-white rounded-[2rem] shadow-2xl border border-slate-200/50 overflow-hidden flex flex-col relative">
-            <div className="absolute top-4 left-6 z-10 flex gap-2">
-               <div className="px-3 py-1 bg-blue-50 text-blue-700 text-[10px] font-black uppercase tracking-widest rounded-full border border-blue-100 shadow-sm flex items-center gap-2">
-                  <div className="w-1.5 h-1.5 bg-blue-600 rounded-full animate-pulse"></div>
-                  {userProfile.state} Portal
-               </div>
-               {userProfile.occupation && (
-                 <div className="px-3 py-1 bg-orange-50 text-orange-700 text-[10px] font-black uppercase tracking-widest rounded-full border border-orange-100 shadow-sm">
-                   Role: {userProfile.occupation}
+        <aside className="w-72 border-r border-slate-200 bg-slate-50 hidden lg:flex flex-col p-6 overflow-y-auto custom-scrollbar">
+           <div className="mb-8">
+              <h3 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-4">Memory Context</h3>
+              <div className="bg-white rounded-2xl p-4 border border-slate-200 shadow-sm space-y-3">
+                 <div className="flex justify-between text-[11px] font-bold">
+                    <span className="text-slate-500">Active State:</span>
+                    <span className="text-blue-600 font-black uppercase tracking-tighter">{userProfile.state}</span>
                  </div>
-               )}
+              </div>
+           </div>
+
+           <div className="mb-8">
+              <h3 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-4">Chat History</h3>
+              <div className="space-y-3">
+                 {pastSessions.length === 0 ? (
+                   <p className="text-[10px] text-slate-400 italic">No past sessions yet.</p>
+                 ) : (
+                   pastSessions.map(session => (
+                     <button key={session.id} onClick={() => setSelectedSession(session)} className="w-full text-left p-3 bg-white border border-slate-200 rounded-xl hover:border-blue-400 transition-all text-[11px] font-medium leading-tight">
+                       {session.summary}
+                     </button>
+                   ))
+                 )}
+              </div>
+           </div>
+
+           <div>
+              <h3 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-4">Thinking Chain</h3>
+              <div className="space-y-4">
+                 {thoughts.map((t, i) => (
+                   <div key={i} className="flex gap-3">
+                      <div className={`w-1 rounded-full shrink-0 ${t.phase === 'PLAN' ? 'bg-blue-400' : 'bg-green-400'}`} />
+                      <p className="text-[10px] font-medium text-slate-700 leading-tight">{t.message}</p>
+                   </div>
+                 ))}
+              </div>
+           </div>
+        </aside>
+
+        <main className="flex-1 flex flex-col p-4 md:p-6 min-w-0 bg-slate-100/30">
+          {errorMessage && (
+            <div className="mb-4 p-5 bg-red-100 border-2 border-red-200 text-red-800 text-sm font-bold rounded-2xl flex items-start gap-4 shadow-xl">
+              <svg className="w-6 h-6 shrink-0" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" /></svg>
+              <p className="opacity-90">{errorMessage}</p>
             </div>
+          )}
+          
+          <div className="flex-1 bg-white rounded-[2rem] shadow-2xl border border-slate-200/50 overflow-hidden flex flex-col relative">
             <div className="flex-1 overflow-y-auto p-8 space-y-8 scroll-smooth custom-scrollbar">
               {history.length === 0 && !liveUserText && !liveModelText ? (
-                <div className="h-full flex flex-col items-center justify-center text-center opacity-30 select-none">
-                  <div className="w-24 h-24 mb-6 bg-slate-100 rounded-full flex items-center justify-center text-slate-300">
-                    <svg className="w-12 h-12" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" /></svg>
-                  </div>
-                  <h2 className="text-2xl font-black text-slate-800 mb-2">Native Agent Online</h2>
-                  <p className="max-w-xs text-sm font-medium">I plan, search, and verify eligibility autonomously. Start speaking in {selectedLanguage.nativeName}.</p>
+                <div className="h-full flex flex-col items-center justify-center text-center opacity-30">
+                  <h2 className="text-3xl font-black text-slate-800 mb-2 italic">Agentic Portal Ready</h2>
+                  <p className="text-sm font-medium">Native ${selectedLanguage.name} support is active.</p>
                 </div>
               ) : (
                 <>
                   {history.map((e, i) => (
-                    <div key={i} className={`flex ${e.role === 'user' ? 'justify-end' : 'justify-start'} animate-in fade-in slide-in-from-bottom-4`}>
-                      <div className={`max-w-[85%] rounded-[1.5rem] px-6 py-4 text-base shadow-sm border ${e.role === 'user' ? 'bg-blue-600 text-white border-blue-500 shadow-lg' : 'bg-white text-slate-800 border-slate-100'}`}>
+                    <div key={i} className={`flex ${e.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                      <div className={`max-w-[85%] rounded-[1.5rem] px-6 py-4 text-base shadow-sm border ${e.role === 'user' ? 'bg-blue-600 text-white border-blue-500 font-medium' : 'bg-slate-50 text-slate-800 border-slate-200 leading-relaxed'}`}>
                         {e.text}
                       </div>
                     </div>
                   ))}
-                  {liveUserText && <div className="flex justify-end opacity-60 italic"><div className="bg-blue-100 text-blue-800 px-5 py-3 rounded-full text-sm font-bold border border-blue-200">{liveUserText}</div></div>}
-                  {liveModelText && <div className="flex justify-start"><div className="bg-white border-slate-200 border px-5 py-3 rounded-full text-sm font-medium shadow-sm animate-pulse">{liveModelText}</div></div>}
+                  {liveUserText && <div className="flex justify-end opacity-50 italic"><div className="bg-blue-50 px-5 py-3 rounded-full text-sm font-bold border border-blue-100">{liveUserText}</div></div>}
+                  {liveModelText && <div className="flex justify-start"><div className="bg-white border-blue-200 border-2 px-5 py-3 rounded-[1.5rem] text-sm font-medium shadow-md animate-pulse">{liveModelText}</div></div>}
                 </>
               )}
             </div>
-            <div className="p-8 bg-slate-50/50 border-t border-slate-100 flex justify-center">
+
+            <div className="p-8 bg-slate-50 border-t border-slate-100 flex justify-center">
               {!isLive ? (
-                <button onClick={startSession} className="px-10 py-5 bg-blue-600 hover:bg-blue-700 text-white rounded-full font-black text-lg shadow-xl shadow-blue-200 transition-all active:scale-95 flex items-center gap-3">
-                  <div className="w-8 h-8 bg-white/20 rounded-full flex items-center justify-center"><svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20"><path d="M7 4a3 3 0 016 0v4a3 3 0 11-6 0V4zm4 10.93A7.001 7.001 0 0017 8a1 1 0 10-2 0A5 5 0 015 8a1 1 0 00-2 0 7.001 7.001 0 006 6.93V17H6a1 1 0 100 2h8a1 1 0 100-2h-3v-2.07z" /></svg></div>
-                  Start Agent Interaction
+                <button 
+                  onClick={startSession} 
+                  disabled={systemAlert?.type === 'error'}
+                  className="px-14 py-6 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 text-white rounded-full font-black text-xl shadow-2xl shadow-blue-200 transition-all active:scale-95 flex items-center gap-4 group"
+                >
+                   Start Voice Session
                 </button>
               ) : (
-                <button onClick={stopSession} className="px-10 py-5 bg-red-600 hover:bg-red-700 text-white rounded-full font-black text-lg shadow-xl shadow-red-200 transition-all active:scale-95 flex items-center gap-3">
-                  <div className="w-8 h-8 bg-white/20 rounded-full flex items-center justify-center"><svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8 7a1 1 0 00-1 1v4a1 1 0 001 1h4a1 1 0 001-1V8a1 1 0 00-1-1H8z" clipRule="evenodd" /></svg></div>
-                  Disconnect
+                <button onClick={stopSession} className="px-14 py-6 bg-red-600 hover:bg-red-700 text-white rounded-full font-black text-xl shadow-2xl shadow-red-200 transition-all active:scale-95 flex items-center gap-4 group">
+                   Disconnect Agent
                 </button>
               )}
             </div>
           </div>
         </main>
-        <aside className="w-80 lg:w-[24rem] border-l border-slate-200 bg-white hidden md:flex flex-col p-6 shadow-2xl z-10">
-          <div className="mb-8">
-            <h3 className="text-xl font-black text-slate-800 flex items-center gap-2 mb-4">
-               <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center shadow-lg"><svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M19 20H5a2 2 0 01-2-2V6a2 2 0 012-2h10a2 2 0 012 2v1m2 13a2 2 0 01-2-2V7m2 13a2 2 0 002-2V9.5a2 2 0 00-2-2h-2" /></svg></div>
-               Agent Intelligence
-            </h3>
-            <div className="flex gap-2">
-               <span className="px-2.5 py-1 bg-slate-100 text-slate-500 text-[9px] font-black rounded-full border border-slate-200 uppercase tracking-tighter">Live Reasoning</span>
-               <span className="px-2.5 py-1 bg-green-50 text-green-600 text-[9px] font-black rounded-full border border-green-100 uppercase tracking-tighter">{userProfile.state}</span>
-            </div>
+
+        <aside className="w-96 border-l border-slate-200 bg-white hidden xl:flex flex-col shadow-xl z-10 overflow-hidden">
+          <div className="p-6 border-b border-slate-100">
+             <h3 className="text-2xl font-black text-slate-800 tracking-tight uppercase">Schemes Database</h3>
           </div>
-          <div className="flex-1 overflow-y-auto space-y-4 pr-2 custom-scrollbar">
+
+          <div className="flex-1 overflow-y-auto p-6 space-y-6 custom-scrollbar bg-slate-50/30">
             {visibleSchemes.length === 0 ? (
-              <div className="flex flex-col items-center justify-center h-40 text-slate-300 border-2 border-dashed rounded-3xl p-6 text-center">
-                <p className="text-xs font-black uppercase tracking-widest mb-1">Awaiting Execution</p>
-                <p className="text-[10px] opacity-70">The agent will populate this as it reasons about your needs.</p>
+              <div className="h-40 border-2 border-dashed border-slate-200 rounded-3xl flex items-center justify-center text-slate-300">
+                <span className="text-[10px] font-black uppercase tracking-widest">Awaiting user query...</span>
               </div>
             ) : (
-              visibleSchemes.map(s => (
-                <div key={s.id} className="group p-5 rounded-3xl border border-slate-100 bg-slate-50 hover:bg-white hover:border-blue-200 hover:shadow-lg transition-all duration-300">
-                  <div className="flex justify-between items-center mb-3">
-                    <span className={`text-[9px] font-black px-2.5 py-1 rounded-full border ${s.state === 'All' ? 'bg-orange-50 text-orange-600 border-orange-100' : 'bg-blue-50 text-blue-600 border-blue-100'}`}>{s.state === 'All' ? 'Central' : s.state}</span>
-                  </div>
-                  <h4 className="font-black text-slate-800 text-sm mb-1.5 leading-tight group-hover:text-blue-600 transition-colors">{s.name}</h4>
-                  <p className="text-[11px] text-slate-500 line-clamp-2 leading-relaxed mb-4">{s.description}</p>
-                  <a href={s.url} target="_blank" rel="noopener noreferrer" className="px-4 py-2 bg-white border border-slate-200 rounded-xl text-[10px] font-black text-blue-600 shadow-sm hover:border-blue-600 hover:bg-blue-50 transition-all flex items-center justify-center gap-2">Official Portal</a>
+              visibleSchemes.map((s) => (
+                <div key={s.id} className="bg-white rounded-[1.5rem] border border-slate-100 shadow-sm p-6 group hover:shadow-md transition-shadow">
+                    <span className="inline-block px-2.5 py-0.5 rounded-full text-[9px] font-black uppercase tracking-wider mb-3 bg-blue-100 text-blue-600">
+                      {s.state} Portal
+                    </span>
+                    <h5 className="font-black text-slate-800 text-lg mb-2 leading-tight group-hover:text-blue-600 transition-colors">{s.name}</h5>
+                    <p className="text-xs text-slate-500 line-clamp-3 leading-relaxed mb-5 italic">{s.description}</p>
+                    <a href={s.url} target="_blank" rel="noopener noreferrer" className="w-full py-3 bg-white border border-slate-200 text-blue-600 rounded-xl text-xs font-black text-center block hover:bg-blue-50">Official Portal</a>
                 </div>
               ))
             )}
           </div>
-          <div className="mt-8 pt-4 border-t border-slate-100 flex items-center justify-center opacity-40"><span className="text-[9px] font-black uppercase tracking-[0.2em]">Verified Welfare Agentic AI</span></div>
         </aside>
       </div>
+
+      {selectedSession && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/95 backdrop-blur-md">
+          <div className="bg-white w-full max-w-3xl max-h-[85vh] rounded-[2.5rem] shadow-2xl flex flex-col overflow-hidden">
+             <div className="p-8 border-b flex justify-between items-center bg-slate-50">
+                <h3 className="text-2xl font-black text-slate-800 tracking-tight italic">Memory Recall</h3>
+                <button onClick={() => setSelectedSession(null)} className="w-10 h-10 rounded-full hover:bg-slate-200 flex items-center justify-center font-bold">X</button>
+             </div>
+             <div className="flex-1 overflow-y-auto p-10 space-y-8 custom-scrollbar bg-slate-100/20">
+                {selectedSession.history.map((entry, idx) => (
+                  <div key={idx} className={`flex ${entry.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                    <div className={`max-w-[85%] rounded-[1.8rem] px-8 py-5 text-base shadow-sm border-2 ${entry.role === 'user' ? 'bg-blue-600 text-white border-blue-500' : 'bg-white text-slate-800 border-white'}`}>
+                      {entry.text}
+                    </div>
+                  </div>
+                ))}
+             </div>
+          </div>
+        </div>
+      )}
+
       <VoiceAgent state={agentState} />
-      <style>{`.custom-scrollbar::-webkit-scrollbar { width: 4px; } .custom-scrollbar::-webkit-scrollbar-track { background: transparent; } .custom-scrollbar::-webkit-scrollbar-thumb { background: #e2e8f0; border-radius: 10px; }`}</style>
+      <style>{`
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; } 
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+      `}</style>
     </div>
   );
 };
