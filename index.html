@@ -4,7 +4,18 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Jan Sahayak AI - Local & Cloud Ready</title>
+    <title>Jan Sahayak AI - Indian Welfare Agent</title>
+    <!-- 
+      1. ADD YOUR API KEY BELOW in the quotes 
+      2. OR set it in Vercel/Netlify Environment Variables as API_KEY
+    -->
+    <script>
+      window.process = window.process || { env: {} };
+      window.process.env = window.process.env || {};
+      
+      // PASTE YOUR KEY INSIDE THE QUOTES BELOW:
+      window.process.env.API_KEY = "AIzaSyDwCaYz2_2l7cKHfb6M4GeuQGSV4PwXp3M"; 
+    </script>
     <script src="https://cdn.tailwindcss.com"></script>
     <script type="importmap">
     {
